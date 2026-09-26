@@ -1,0 +1,10 @@
+{
+  "dataset": "data/ahc001",
+  "run_dir": "runs/offline",
+  "provider": "offline",
+  "backend": "native",
+  "iterations": 24,
+  "seed": 42,
+  "workers": 2,
+  "timeout": 5.0
+}

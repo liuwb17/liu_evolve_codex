@@ -1,0 +1,15 @@
+{
+  "dataset": "data/ale_public",
+  "run_dir": "runs/ale_deepseek",
+  "provider": "chat",
+  "backend": "ale",
+  "base_url": "https://api.deepseek.com",
+  "model": "deepseek-flash",
+  "api_key_env": "AAD_API_KEY",
+  "iterations": 30,
+  "max_requests": 40,
+  "max_output_tokens": 8192,
+  "request_options": {"thinking": {"type": "disabled"}, "response_format": {"type": "json_object"}},
+  "workers": 4,
+  "timeout": 5.0
+}

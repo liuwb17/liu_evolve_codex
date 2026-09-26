@@ -1,0 +1,16 @@
+{
+  "dataset": "data/ahc001",
+  "run_dir": "runs/deepseek",
+  "provider": "chat",
+  "backend": "docker",
+  "base_url": "https://api.deepseek.com",
+  "model": "deepseek-flash",
+  "api_key_env": "AAD_API_KEY",
+  "iterations": 6,
+  "max_requests": 10,
+  "max_output_tokens": 8192,
+  "request_timeout": 180,
+  "request_options": {"thinking": {"type": "disabled"}, "response_format": {"type": "json_object"}},
+  "workers": 2,
+  "timeout": 5.0
+}
