@@ -7,6 +7,7 @@ from unittest.mock import patch
 from aad.v3_evaluator import CleanEvaluator
 from aad.v3_provider import PROBLEM
 from aad.problem import Case
+from aad.io import digest, save_json
 
 class ColdStartTests(unittest.TestCase):
     def test_problem_is_specification_not_seed(self):
@@ -33,7 +34,34 @@ class ColdStartTests(unittest.TestCase):
             self.assertNotIn('seed_v2',command)
 
     def test_public_split_is_disjoint(self):
+        # Synthetic loader fixture only: never presented as official benchmark data.
         root=Path(__file__).resolve().parents[1]
+        spec=importlib.util.spec_from_file_location('v3_public_fixture',root/'scripts/v3_search.py')
+        module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
+        with tempfile.TemporaryDirectory() as temporary:
+            project=Path(temporary);folder=project/'data/official_public'
+            (folder/'inputs').mkdir(parents=True)
+            records=[]
+            for i in range(50):
+                name=f'inputs/{i:04d}.txt';text=f'1\n{i} 0 1\n'
+                (folder/name).write_text(text,encoding='utf-8')
+                records.append({'file':name,'seed':i,'sha256':digest(text)})
+            save_json(folder/'manifest.json',{'splits':{'legacy_a':records[30:][::-1],
+                'legacy_b':records[:30][::-1]}})
+            with patch.object(module,'PROJECT',project):
+                cases,_=module.public_cases()
+                self.assertEqual([c.name for c in cases],[f'public_{i:04d}' for i in range(50)])
+                train={c.fingerprint for i,c in enumerate(cases) if i%5!=4}
+                validation={c.fingerprint for i,c in enumerate(cases) if i%5==4}
+                self.assertEqual(len(train),40);self.assertEqual(len(validation),10)
+                self.assertFalse(train & validation)
+                (folder/'inputs/0000.txt').write_text('changed\n',encoding='utf-8')
+                with self.assertRaises(AssertionError):module.public_cases()
+
+    def test_official_public_split_when_data_available(self):
+        root=Path(__file__).resolve().parents[1]
+        if not (root/'data/official_public/manifest.json').exists():
+            self.skipTest('Optional integration check: official public data not installed')
         spec=importlib.util.spec_from_file_location('v3_search',root/'scripts/v3_search.py')
         module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module)
         cases,_=module.public_cases()
