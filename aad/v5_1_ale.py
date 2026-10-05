@@ -12,6 +12,7 @@ from .io import digest, read_json, save_json
 from .problem import Case
 from .v5_1_evaluation import (EVALUATION_PROTOCOL, aggregate_evaluations,
                               evaluation_seeds, seeded_source)
+from .v5_1_execution import EXECUTION_PROTOCOL
 
 ALE_COMMIT = '3da9b12fb5d112dabb3af693d1a42031c95142bc'
 DATA_REVISION = '0f42617'
@@ -190,6 +191,7 @@ def runtime_identity(root):
     if 'gen' not in binaries or 'tester' not in binaries:
         raise ValueError('Build the official gen and tester tools before running')
     return {'ale_version': importlib.metadata.version('ale-bench'),
+            'execution_protocol': EXECUTION_PROTOCOL,
             'sdk_sha256': digest(json.dumps(sdk_hashes, sort_keys=True)),
             'binaries': binaries, 'docker_images': images, 'judge_version': '202301',
             'cpu_policy': cpu_policy}

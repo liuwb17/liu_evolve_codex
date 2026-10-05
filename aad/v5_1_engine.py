@@ -370,4 +370,8 @@ class V51Engine(V5Engine):
                 'plan_enabled': self.config['plan'], 'plan_call': self.s.get('plan_call'),
                 'is_randomized': record['is_randomized'], 'evaluation_count': len(record['evaluations']),
                 'private_evaluated': False, 'selection': 'mean score; one deterministic or three seeded evaluations'})
+            if self.s.get('migration'):
+                report = read_json(self.root / 'report.json')
+                report['migration'] = self.s['migration']
+                save_json(self.root / 'report.json', report)
         return winner

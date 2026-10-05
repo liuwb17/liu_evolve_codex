@@ -129,6 +129,9 @@ class CpuTests(unittest.TestCase):
         exec('''
 def docker_client():
     raise AssertionError('Original client must not be used')
+
+def build_batch_run_command(output_file='/tmp/output.txt', profiles_file='/tmp/profiles.json'):
+    return 'solver; sync'
 def run_batch_run_container():
     start = clock[0]
     with docker_client() as client:

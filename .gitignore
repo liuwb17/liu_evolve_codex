@@ -14,6 +14,7 @@ build/
 # Repository handoff: never publish experiment corpora or credentials.
 data/
 experiments/
+/exp_log.md
 .env.*
 !.env.example
 *.pem

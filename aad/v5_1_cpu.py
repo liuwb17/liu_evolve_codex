@@ -5,6 +5,7 @@ A lease covers both SMT siblings; only one logical CPU executes a submission.
 Stale leases are deliberately not stolen: their owner may still be executing.
 """
 from contextlib import contextmanager
+import inspect
 from pathlib import Path
 import threading
 import time
@@ -12,6 +13,8 @@ from types import FunctionType
 import uuid
 
 from .io import save_json
+from .v5_1_execution import (DOCKER_API_TIMEOUT, GuardedContainer, container_timeout,
+                             scoped_batch_command)
 
 
 CPU_PROTOCOL = '9950x3d-smt-leases-1'
@@ -125,7 +128,10 @@ class PinnedContainers:
             kwargs['labels'] = {**kwargs.get('labels', {}), LEASE_LABEL: lease['token'], ROLE_LABEL: 'submission'}
         else:
             kwargs['labels'] = {**kwargs.get('labels', {}), ROLE_LABEL: 'service'}
-        return self.containers.run(*args, **kwargs)
+        container = self.containers.run(*args, **kwargs)
+        if lease and getattr(self.local, 'deadline', None) is not None:
+            return GuardedContainer(container, self.local.deadline, self.local.failure_path)
+        return container
 
 
 class PinnedClient:
@@ -155,14 +161,24 @@ def isolated_runner(module, pool):
             yield PinnedClient(client, local, pool.policy)
 
     original = namespace['run_batch_run_container']
+    signature = inspect.signature(original)
+    namespace['build_batch_run_command'] = scoped_batch_command(namespace['build_batch_run_command'])
 
     def submission(*args, **kwargs):
         with pool.lease() as lease:
             local.lease = lease
+            arguments = signature.bind(*args, **kwargs)
+            arguments.apply_defaults()
+            if 'time_limit' in arguments.arguments:
+                local.deadline = time.monotonic() + container_timeout(arguments.arguments['time_limit'])
+                local.failure_path = pool.audit_root / (lease['token'] + '.failure.json')
             try:
                 return original(*args, **kwargs)
             finally:
                 del local.lease
+                if hasattr(local, 'deadline'):
+                    del local.deadline
+                    del local.failure_path
 
     namespace['docker_client'] = docker_client
     namespace['run_batch_run_container'] = submission
@@ -180,5 +196,13 @@ def make_runner(policy, audit_root):
     from ale_bench import constants
     from ale_bench.tool_wrappers import case_runner
     from ale_bench.utils import docker_client
-    pool = CorePool(docker_client, constants.RUST_TOOL_DOCKER_IMAGE, policy, audit_root)
+    @contextmanager
+    def bounded_client():
+        with docker_client() as client:
+            # Bound daemon RPCs, including failed forced cleanup; keep the lease
+            # if cleanup cannot be confirmed. container.wait supplies its own limit.
+            client.api.timeout = DOCKER_API_TIMEOUT
+            yield client
+
+    pool = CorePool(bounded_client, constants.RUST_TOOL_DOCKER_IMAGE, policy, audit_root)
     return isolated_runner(case_runner, pool)
