@@ -13,6 +13,11 @@ from .io import digest, read_json, save_json
 from .v5_engine import V5Engine
 from .v5_policy import CYCLE, pool, valid_for_archive
 from .v5_provider import V5Provider
+from .v5_1_plan import PLAN_RULE, ensure_plan
+from .v5_1_parallel import request_many, run_parallel
+from .v5_1_experience import augment_task, note_response, record_attempt
+from .v5_1_evaluation import (EVALUATION_PROTOCOL, RANDOMNESS_RULE, aggregate_evaluations,
+                              evaluation_seeds, from_rows, parse_candidate)
 
 
 class V51Provider(V5Provider):
@@ -20,24 +25,78 @@ class V51Provider(V5Provider):
         if not isinstance(problem, str) or not problem.strip():
             raise ValueError('Task statement is required')
         self.problem = problem
+        self._planner = None
         super().__init__(*args, **kwargs)
+
+    @property
+    def planner(self):
+        if self._planner is None:
+            self._planner = V51Provider(self.root / 'planning', self.model, 1, 0,
+                                       key=self.key, problem=self.problem)
+        return self._planner
 
     def request(self, kind, task):
         # v5 merges task after its legacy problem field. Replace it explicitly.
         return super().request(kind, {**task, 'problem': self.problem})
 
+    def request_many(self, jobs):
+        return request_many(self, jobs)
+
+    def request_body(self, kind, task):
+        if kind != 'plan':
+            body = super().request_body(kind, task)
+            rule = ('Return only JSON with hypothesis (short string), code (complete executable '
+                    'C++17 source ending with // AAD_V5_COMPLETE), and is_randomized (boolean). '
+                    if kind == 'program' else
+                    'Return only JSON with hypothesis, parent_sha256, edits (1..6 objects with old/new '
+                    'source strings), and is_randomized (boolean). Anchors must be unique, disjoint '
+                    'substrings of the ORIGINAL parent. Preserve // AAD_V5_COMPLETE. ')
+            body['messages'][0]['content'] = (
+                'You are an optimization algorithm researcher. Invent from the problem and this run only; '
+                'never reconstruct named submissions. Reason about search and feasible states before '
+                'implementation. Do not sacrifice algorithm quality merely to minimize source size. '
+                + rule + RANDOMNESS_RULE)
+            body['response_format'] = {'type': 'json_object'}
+            return body
+        return {'model': self.model, 'max_tokens': 65536,
+                'thinking': {'type': 'enabled'}, 'reasoning_effort': 'low',
+                'response_format': {'type': 'json_object'},
+                'messages': [{'role': 'system', 'content': PLAN_RULE},
+                             {'role': 'user', 'content': json.dumps({'problem': self.problem},
+                                                                    ensure_ascii=False)}]}
+
 
 class V51Engine(V5Engine):
     def __init__(self, root, provider, evaluate, train, config):
-        config = {'repeats': 3, 'initial_valid_roots': 4, 'max_initial_attempts': 20,
-                  'promotion_margin': 0.0, 'repeat_slack': 0.0, 'smoke_count': 6,
+        if any(key in config for key in ('repeats', 'repeat_slack')):
+            raise ValueError('Legacy repeat confirmation settings are no longer supported')
+        config = {'initial_valid_roots': 4, 'max_initial_attempts': 20,
+                  'promotion_margin': 0.0, 'smoke_count': 6,
+                  'plan': False, 'failure_experience': False,
                   **config}
+        config['evaluation_protocol'] = EVALUATION_PROTOCOL
+        config['runtime_ratio_protocol'] = 'mean-total-process-time-1'
+        if type(config['failure_experience']) is not bool:
+            raise ValueError('failure_experience must be a boolean')
+        if config['failure_experience']:
+            config['failure_experience_protocol'] = 'parent-last-eight-1'
+        para = config.get('para')
+        if para is not None and (type(para) is not int or para != 4):
+            raise ValueError('para must be None or 4')
+        if para == 4:
+            if config['initial_valid_roots'] != 4:
+                raise ValueError('para=4 requires four initial roots')
+            config['parallel_protocol'] = 'four-lineages-rounds-2-runtime'
+        if type(config['plan']) is not bool:
+            raise ValueError('plan must be a boolean')
+        if config['plan'] and config['initial_valid_roots'] != 4:
+            raise ValueError('Plan requires four initial roots')
+        if config['plan']:
+            config['plan_protocol'] = 'four-cold-start-directions-2-separate-budget'
         for key in ('initial_valid_roots', 'max_initial_attempts', 'smoke_count'):
             if type(config[key]) is not int or config[key] < 1:
                 raise ValueError(f'{key} must be a positive integer')
-        if config['repeats'] != 3:
-            raise ValueError('v5.1 requires three repeats and two positive directions')
-        for key in ('promotion_margin', 'repeat_slack'):
+        for key in ('promotion_margin',):
             if not math.isfinite(config[key]) or config[key] < 0:
                 raise ValueError(f'Invalid {key}')
         if config.get('direction') not in ('maximize', 'minimize'):
@@ -52,7 +111,7 @@ class V51Engine(V5Engine):
         self.path = self.root / 'state.json'
         self.provider, self.evaluate, self.train, self.config = provider, evaluate, train, config
         self.sign = 1 if config['direction'] == 'maximize' else -1
-        protocol = {'version': '5.1', 'config': config,
+        protocol = {'version': '5.2', 'config': config,
                     'inputs': {c.name: c.fingerprint for c in train},
                     'train': [c.name for c in train], 'validation': []}
         signature = digest(json.dumps(protocol, sort_keys=True))
@@ -68,42 +127,78 @@ class V51Engine(V5Engine):
         save_json(self.root / 'protocol.json', protocol)
         self.save()
 
+    def run(self):
+        if self.s['frozen'] or self.s['validation_started'] or self.s.get('development_closed'):
+            raise ValueError('Development is closed')
+        if (self.root / 'STOP_AFTER_CURRENT').exists():
+            return
+        if self.config['plan']:
+            ensure_plan(self)
+        if self.config.get('para') == 4:
+            return run_parallel(self)
+        super().run()
+
     def mean(self, ident):
-        return statistics.mean(r['mean'] for r in self.s['records'][ident]['repeats'])
+        return self.s['records'][ident]['full']['mean']
+
+    def parse_response(self, kind, parent, content):
+        return parse_candidate(kind, self.source(parent) if parent else None, content)
+
+    def augment_task(self, pending, task):
+        return augment_task(self, pending, task)
+
+    def note_response(self, pending, content):
+        note_response(self, pending, content)
+
+    def record_attempt(self, pending):
+        record_attempt(self, pending)
 
     def measure(self, ident):
         record = self.s['records'][ident]
+        seeds = evaluation_seeds(record.get('is_randomized'))
+        evaluations = record.setdefault('evaluations', [])
+        if 'full' in record:
+            self.record_runtime(record, record['full'])
+            return record['full']['valid']
         if 'smoke' not in record:
-            # Full official limit: ALE does not pass a short-budget argv to solvers.
             record['smoke'] = self.evaluate(self.source(ident),
-                self.train[:self.config['smoke_count']], self.config['time_limit'], 'smoke')
+                self.train[:self.config['smoke_count']], self.config['time_limit'], 'smoke', seed=seeds[0])
             self.save()
         if not record['smoke']['valid']:
+            self.record_runtime(record, record['smoke'])
             return False
-        if 'full' not in record:
-            record['full'] = self.evaluate(self.source(ident), self.train,
-                                           self.config['time_limit'], 'train-r0')
+        if not evaluations:
+            # Reuse precheck rows so each case is evaluated only once for the first seed.
+            remaining = self.train[self.config['smoke_count']:]
+            rows = list(record['smoke']['cases'])
+            if remaining:
+                rest = self.evaluate(self.source(ident), remaining, self.config['time_limit'],
+                                     'train-r0', seed=seeds[0])
+                rows.extend(rest['cases'])
+            evaluations.append({**from_rows(rows), 'seed': seeds[0]})
             self.save()
-        if not record['full']['valid']:
-            return False
-        record.setdefault('repeats', [record['full']])
-        self.save()
-        return True
+        while len(evaluations) < len(seeds) and all(r['valid'] for r in evaluations):
+            i = len(evaluations)
+            evaluations.append(self.evaluate(self.source(ident), self.train,
+                self.config['time_limit'], f'train-r{i}', seed=seeds[i]))
+            self.save()
+        record['full'] = aggregate_evaluations(evaluations)
+        self.record_runtime(record, record['full'])
+        return record['full']['valid']
 
-    def repeat(self, ident, cases, prefix, key):
-        record = self.s['records'][ident]
-        record.setdefault(key, [])
-        while len(record[key]) < self.config['repeats']:
-            replica = f'{prefix}-r{len(record[key])}'
-            record[key].append(self.evaluate(self.source(ident), cases,
-                                             self.config['time_limit'], replica))
-            self.save()
-        return all(r['valid'] for r in record[key])
+    def record_runtime(self, record, result):
+        # full.cases already averages each case over its actual algorithm seeds.
+        # Failed prechecks describe only the cases that were actually executed.
+        record['runtime_ratio'] = statistics.mean(r['seconds'] for r in result['cases']) / self.config['time_limit']
+        record['runtime_ratio_basis'] = 'total_process_time'
+        self.save()
 
     def timing(self, record):
         elapsed = statistics.mean(r['seconds'] for r in record['full']['cases'])
         limit = self.config['time_limit']
         return {'allocated_seconds': limit, 'mean_process_seconds': elapsed,
+                'runtime_ratio': record.get('runtime_ratio', elapsed / limit),
+                'runtime_ratio_basis': 'total_process_time',
                 'utilization': elapsed / limit, 'underutilized': elapsed < limit / 2,
                 'instruction': 'Seek useful score-improving search, never padding or sleep. '
                                'Finishing early is fine when additional search is not useful.'}
@@ -111,14 +206,17 @@ class V51Engine(V5Engine):
     def feedback(self, ident):
         record = self.s['records'][ident]
         result = record.get('full', record['smoke'])
-        failed = next((r for r in record.get('repeats', []) if not r['valid']), None)
+        failed = next((r for r in record.get('evaluations', []) if not r['valid']), None)
         if failed:
             result = failed
         by_name = {c.name: c for c in self.train}
         rows = sorted(result['cases'], key=lambda r: (r['status'] == 'AC', r['score']))[:2]
         return {'train_mean': result['raw_mean'], 'direction': self.config['direction'],
-                'failure_on_repeat': failed is not None,
-                'examples': [{'name': r['name'], 'score': r['raw_score'],
+                'is_randomized': record['is_randomized'],
+                'evaluation_count': len(record.get('evaluations', [])),
+                'failed_evaluation': failed is not None,
+                'examples': [{'name': r['name'], 'score': r.get('sample_raw_score', r['raw_score']),
+                              'mean_score': r['raw_score'], 'seed': r.get('seed', 0),
                               'status': r['status'], 'input': by_name[r['name']].text,
                               'output': r.get('stdout', ''),
                               'message': r.get('message', '')[-6000:]} for r in rows],
@@ -131,17 +229,27 @@ class V51Engine(V5Engine):
         if self.s['repair']:
             parent, self.s['repair'] = self.s['repair'], None
             return {'arm': 'repair', 'parent': parent,
-                    'instruction': 'Repair the demonstrated error including repeat-only failure. '
+                    'instruction': 'Repair the demonstrated error including seed-specific failure. '
                                    'Keep intended search quality. Return the full corrected program.'}
         roots = {r['lineage'] for r in records.values() if valid_for_archive(r)}
         if not archive or (len(roots) < self.config['initial_valid_roots']
-                           and self.s['root_attempts'] < self.config['max_initial_attempts']):
-            if self.s['root_attempts'] >= self.config['max_initial_attempts'] and not archive:
+                           and (self.config['plan'] or self.s['root_attempts'] < self.config['max_initial_attempts'])):
+            if not self.config['plan'] and self.s['root_attempts'] >= self.config['max_initial_attempts'] and not archive:
                 raise RuntimeError('No legal cold start within attempt cap')
             self.s['root_attempts'] += 1
-            return {'arm': 'independent', 'parent': None,
+            task = {'arm': 'independent', 'parent': None,
                     'instruction': 'Invent a complete optimizer from the specification without seed code. '
                                    'Design construction and useful search; prioritize algorithm quality.'}
+            if self.config['plan']:
+                completed = {r.get('initial_direction') for r in records.values() if valid_for_archive(r)}
+                remaining = [i for i in range(4) if i not in completed]
+                # Try all four once before retrying directions that failed; repairs keep their lineage.
+                attempts = [sum(e.get('initial_direction') == i and e['arm'] == 'independent'
+                                for e in events) for i in range(4)]
+                index = min(remaining, key=lambda i: (attempts[i], i))
+                task['initial_direction'] = index
+                task['instruction'] += ' Suggested design direction: ' + self.s['plan']['directions'][index]
+            return task
         slot = self.s['schedule_slot']
         self.s['schedule_slot'] += 1
         arm = CYCLE[slot % len(CYCLE)]
@@ -187,33 +295,48 @@ class V51Engine(V5Engine):
 
     def qualify(self, ident, pending):
         record = self.s['records'][ident]
+        if self.config['plan']:
+            index = pending.get('initial_direction')
+            if index is None and pending.get('parent'):
+                index = self.s['records'][pending['parent']].get('initial_direction')
+            if index is not None:
+                record['initial_direction'] = index
         if not self.measure(ident):
             pending['status'] = 'invalid_candidate'
+            if pending['arm'] != 'repair':
+                self.s['repair'] = ident
+            return
+        incumbent = self.s['incumbent']
+        gain = None if incumbent is None else self.mean(ident) - self.mean(incumbent)
+        pending['selection'] = {'mean_gain': gain,
+                                'evaluation_count': len(record['evaluations'])}
+        if incumbent is None or gain > self.config['promotion_margin']:
+            self.s['incumbent'] = ident
+            pending['status'] = 'incumbent_promoted'
         else:
-            incumbent = self.s['incumbent']
-            promising = (incumbent is None or pending['parent'] is None or
-                         record['full']['mean'] >= self.mean(incumbent) - self.config['repeat_slack'])
-            if not promising:
-                pending['status'] = 'archived'
-                return
-            if not self.repeat(ident, self.train, 'train', 'repeats'):
-                pending['status'] = 'invalid_repeat'
-            else:
-                gains = [] if incumbent is None else [a['mean'] - b['mean'] for a, b in zip(
-                    record['repeats'], self.s['records'][incumbent]['repeats'], strict=True)]
-                if gains:
-                    pending['confirmation'] = {'mean_gain': statistics.mean(gains), 'repeat_gains': gains}
-                if incumbent is None or (statistics.mean(gains) > self.config['promotion_margin']
-                                         and sum(g > 0 for g in gains) >= 2):
-                    self.s['incumbent'] = ident
-                    pending['status'] = 'incumbent_promoted'
-                else:
-                    pending['status'] = 'archived'
-                return
-        if pending['arm'] != 'repair':
-            self.s['repair'] = ident
+            pending['status'] = 'archived'
 
     def finalize(self):
+        if self.config.get('para') == 4:
+            batch = self.s.get('parallel_batch')
+            if batch:
+                ledger_path = self.root / 'llm/ledger.json'
+                requests = self.provider.requests if self.provider else (
+                    len(read_json(ledger_path)) if ledger_path.exists() else 0)
+                if not batch.get('budget_exhausted') or any(
+                        t['implementation_call'] < requests for t in batch['tasks']):
+                    raise ValueError('Pending parallel round')
+            roots = {r['lineage'] for r in self.s['records'].values() if valid_for_archive(r)}
+            if len(roots) != 4:
+                raise ValueError('Parallel initialization incomplete: need four valid lineages')
+            if batch:
+                self.s['unsubmitted_batch'] = batch
+                self.s['parallel_batch'] = None
+        if self.config['plan']:
+            completed = {r.get('initial_direction') for r in self.s['records'].values()
+                         if valid_for_archive(r)}
+            if not set(range(4)).issubset(completed):
+                raise ValueError('Plan initialization incomplete: need four valid initial directions')
         if self.s['pending']:
             if self.s['pending'].get('status') != 'budget_exhausted':
                 raise ValueError('Pending experiment')
@@ -221,19 +344,30 @@ class V51Engine(V5Engine):
             self.s['pending'] = None
         winner = self.s.get('champion') if self.s['frozen'] else self.s['incumbent']
         if not winner:
-            raise ValueError('No valid repeated incumbent')
+            raise ValueError('No valid evaluated incumbent')
         record = self.s['records'][winner]
-        if len(record.get('repeats', [])) != 3 or not valid_for_archive(record):
-            raise ValueError('Champion must have three valid training repeats')
+        if (len(record.get('evaluations', [])) != len(evaluation_seeds(record.get('is_randomized')))
+                or not valid_for_archive(record)):
+            raise ValueError('Champion must have all required valid evaluations')
         code = self.source(winner)
         self.s.update(frozen=True, development_closed=True, champion=winner)
         self.save()
         (self.root / 'best.cpp').write_text(code, encoding='utf-8')
         if not (self.root / 'report.json').exists():
             ledger = read_json(self.root / 'llm/ledger.json') if (self.root / 'llm/ledger.json').exists() else []
+            plan_path = self.root / 'planning/llm/ledger.json'
+            plan_ledger = read_json(plan_path) if plan_path.exists() else []
+            solve_requests = self.provider.requests if self.provider else len(ledger)
             save_json(self.root / 'report.json', {
-                'version': '5.1', 'champion': winner, 'direction': self.config['direction'],
+                'version': '5.2', 'champion': winner, 'direction': self.config['direction'],
                 'train_mean': self.sign * self.mean(winner), 'train_count': len(self.train),
-                'requests': self.provider.requests if self.provider else len(ledger),
-                'private_evaluated': False, 'selection': 'training mean and two-of-three repeat gate'})
+                'requests': solve_requests + len(plan_ledger),
+                'solve_requests': solve_requests, 'plan_requests': len(plan_ledger),
+                'para': self.config.get('para'),
+                'failure_experience': self.config['failure_experience'],
+                'requested_calls': self.config.get('calls', self.s.get('requested_calls')),
+                'effective_calls': self.s.get('effective_calls', self.config.get('calls')),
+                'plan_enabled': self.config['plan'], 'plan_call': self.s.get('plan_call'),
+                'is_randomized': record['is_randomized'], 'evaluation_count': len(record['evaluations']),
+                'private_evaluated': False, 'selection': 'mean score; one deterministic or three seeded evaluations'})
         return winner

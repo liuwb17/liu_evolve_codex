@@ -13,6 +13,7 @@ from aad.problem import Case
 from aad.v5_policy import pool
 from aad.v5_1_ale import AleBatchEvaluator, load_task, prepare, private_test, statement_for, summarize
 from aad.v5_1_engine import V51Engine, V51Provider
+from aad.v5_1_evaluation import aggregate_evaluations
 
 
 CODE = 'int main(){return 0;}\n// AAD_V5_COMPLETE\n'
@@ -39,10 +40,10 @@ class FakeProvider:
         code = CODE.replace('return 0', f'return {call}')
         if kind == 'edit':
             old = task['parent_source']
-            content = json.dumps({'hypothesis': 'improve', 'parent_sha256': task['parent_sha256'],
+            content = json.dumps({'hypothesis': 'improve', 'is_randomized': False, 'parent_sha256': task['parent_sha256'],
                                   'edits': [{'old': old, 'new': code}]})
         else:
-            content = code
+            content = json.dumps({'code': code, 'hypothesis': 'improve', 'is_randomized': False})
         save_json(self.root / 'llm' / f'{call:05d}.response.json',
                   {'choices': [{'message': {'content': content}}]})
         self.ledger.append({'status': 'ok', 'usage': {'total_tokens': 10}})
@@ -64,7 +65,7 @@ class V51Tests(unittest.TestCase):
         (folder / 'solution.cpp').write_text(code, encoding='utf-8')
         r = result(values, engine.train, direction)
         engine.s['records'][key] = {'lineage': key, 'parent': parent,
-                                    'smoke': r, 'full': r, 'repeats': [r, r, r]}
+                                    'smoke': r, 'full': r, 'evaluations': [r], 'is_randomized': False}
         return key
 
     def test_full_workflow_maximize_minimize_and_negative_scores(self):
@@ -72,7 +73,7 @@ class V51Tests(unittest.TestCase):
             with self.subTest(direction=direction), tempfile.TemporaryDirectory() as root:
                 cases, seen = self.cases(), []
                 sign = 1 if direction == 'maximize' else -1
-                def evaluate(code, subset, seconds, replica):
+                def evaluate(code, subset, seconds, replica, *, seed=0):
                     self.assertEqual(seconds, 2)
                     seen.extend(c.name for c in subset)
                     call = int(code.split('return ')[1].split(';')[0])
@@ -113,8 +114,8 @@ class V51Tests(unittest.TestCase):
             self.assertEqual(feedback['examples'][0]['score'], 30)
             self.assertEqual(feedback['train_mean'], 20)
 
-    def test_repeat_direction_gate_and_margin(self):
-        for gains, margin, promoted in (([1, 1, -1], 0, True), ([5, -1, -1], 0, False),
+    def test_mean_only_gate_and_margin(self):
+        for gains, margin, promoted in (([1, 1, -1], 0, True), ([5, -1, -1], 0, True),
                                          ([0, 0, 0], 0, False), ([1, 1, 1], 1, False)):
             with self.subTest(gains=gains, margin=margin), tempfile.TemporaryDirectory() as root:
                 cases = self.cases()
@@ -123,22 +124,28 @@ class V51Tests(unittest.TestCase):
                 old = self.add(engine, 1, [10] * len(cases))
                 new = self.add(engine, 2, [11] * len(cases))
                 engine.s['incumbent'] = old
-                engine.s['records'][new]['repeats'] = [result([10 + g] * len(cases), cases) for g in gains]
+                r = engine.s['records'][new]
+                r['is_randomized'] = True
+                r['evaluations'] = [result([10 + g] * len(cases), cases) for g in gains]
+                r['full'] = aggregate_evaluations(r['evaluations'])
                 pending = {'parent': old, 'arm': 'local'}
                 engine.qualify(new, pending)
                 self.assertEqual(engine.s['incumbent'] == new, promoted)
 
-    def test_repeat_failure_repairs_and_excludes_candidate(self):
+    def test_seed_failure_repairs_and_excludes_candidate(self):
         with tempfile.TemporaryDirectory() as root:
             cases = self.cases()
             engine = V51Engine(root, None, None, cases, self.config())
             key = self.add(engine, 1, [10] * len(cases))
-            engine.s['records'][key]['repeats'][1] = result([0] * len(cases), cases, status='WRONG_ANSWER')
+            r = engine.s['records'][key]
+            r['is_randomized'] = True
+            r['evaluations'].append(result([0] * len(cases), cases, status='WRONG_ANSWER'))
+            r['full'] = aggregate_evaluations(r['evaluations'])
             pending = {'parent': None, 'arm': 'independent'}
             engine.qualify(key, pending)
-            self.assertEqual(pending['status'], 'invalid_repeat')
+            self.assertEqual(pending['status'], 'invalid_candidate')
             self.assertEqual(pool(engine.s['records']), [])
-            self.assertTrue(engine.feedback(key)['failure_on_repeat'])
+            self.assertTrue(engine.feedback(key)['failed_evaluation'])
             self.assertEqual(engine.task()['arm'], 'repair')
 
     def test_protocol_and_training_validation(self):
@@ -156,7 +163,7 @@ class V51Tests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as root:
             cases, attempts = self.cases(), []
             provider = FakeProvider(root, calls=1)
-            def evaluate(code, subset, seconds, replica):
+            def evaluate(code, subset, seconds, replica, *, seed=0):
                 attempts.append(replica)
                 if len(attempts) == 1:
                     raise OSError('temporary infrastructure outage')
@@ -170,7 +177,7 @@ class V51Tests(unittest.TestCase):
             self.assertEqual(provider.requests, 1)
             self.assertEqual(len(resumed.s['records']), 1)
             self.assertIsNone(resumed.s['pending'])
-            self.assertEqual(attempts, ['smoke', 'smoke', 'train-r0', 'train-r1', 'train-r2'])
+            self.assertEqual(attempts, ['smoke', 'smoke'])
 
     def test_provider_injects_only_actual_task(self):
         class Response:
@@ -262,7 +269,7 @@ class AleBundleTests(unittest.TestCase):
             calls = []
             def run_cases(*, inputs, code, code_language, judge_version, time_limit,
                           memory_limit, problem_id, problem_type, tool_dir, return_details,
-                          skip_local_visualization, num_workers):
+                          skip_local_visualization):
                 calls.append(locals())
                 self.assertEqual((code_language, judge_version, problem_type), ('cpp17', '202301', 'batch'))
                 self.assertEqual((time_limit, memory_limit, problem_id), (2, 1024, 'toy'))
@@ -273,12 +280,16 @@ class AleBundleTests(unittest.TestCase):
                     CodeLanguage=SimpleNamespace(CPP17='cpp17'), JudgeVersion=SimpleNamespace(V202301='202301')),
                 'ale_bench.data': SimpleNamespace(ProblemType=SimpleNamespace(BATCH='batch')),
                 'ale_bench.tool_wrappers': SimpleNamespace(run_cases=run_cases)}
-            with patch.dict(sys.modules, modules), patch('aad.v5_1_ale.runtime_identity', return_value={}):
+            with patch.dict(sys.modules, modules), patch('aad.v5_1_ale.runtime_identity',
+                    return_value={'cpu_policy': {}}), patch('aad.v5_1_cpu.make_runner', return_value=run_cases):
                 evaluator = AleBatchEvaluator(bundle, Path(root) / 'cache')
                 first = evaluator(CODE, cases, 2, 'train-r0')
                 self.assertEqual(evaluator(CODE, cases, 2, 'train-r0'), first)
                 evaluator(CODE, cases, 2, 'train-r1')
-                self.assertEqual(len(calls), 2)
+                evaluator(CODE, cases, 2, 'train-r1', seed=1)
+                self.assertEqual(len(calls), 3)
+                self.assertTrue(calls[0]['code'].startswith('#define AAD_RANDOM_SEED 0ULL'))
+                self.assertTrue(calls[2]['code'].startswith('#define AAD_RANDOM_SEED 1ULL'))
                 self.assertEqual((first['raw_mean'], first['mean']), (12, -12))
                 with self.assertRaisesRegex(ValueError, 'official task time limit'):
                     evaluator(CODE, cases, .6, 'smoke')
@@ -300,7 +311,7 @@ class AleBundleTests(unittest.TestCase):
             before = copy.deepcopy(engine.s)
             class Evaluator:
                 runtime = {}
-                def __call__(self, code, subset, seconds, replica):
+                def __call__(self, code, subset, seconds, replica, *, seed=0):
                     return result([30] * len(subset), subset, 'minimize')
             with patch('aad.v5_1_ale.AleBatchEvaluator', return_value=Evaluator()), patch(
                     'aad.v5_1_ale.generate', return_value=['private a', 'private b']) as gen:
@@ -326,6 +337,34 @@ class AleBundleTests(unittest.TestCase):
             with patch('aad.v5_1_ale.generate') as gen, self.assertRaisesRegex(ValueError, 'source changed'):
                 private_test(run, bundle, archive)
             gen.assert_not_called()
+
+    def test_randomized_private_uses_three_seeds_and_mean(self):
+        with tempfile.TemporaryDirectory() as root:
+            archive, bundle = self.prepare(root)
+            task, cases = load_task(bundle)
+            run = Path(root) / 'run'
+            engine = V51Engine(run, None, None, cases, {'direction': 'minimize', 'time_limit': 2,
+                'task_sha256': digest(json.dumps(task, sort_keys=True)), 'runtime': {}, 'workers': 1})
+            key = V51Tests().add(engine, 1, [20] * len(cases), 'minimize')
+            record = engine.s['records'][key]
+            record['is_randomized'] = True
+            record['evaluations'] = [copy.deepcopy(record['full']) for _ in range(3)]
+            record['full'] = aggregate_evaluations(record['evaluations'])
+            engine.s['incumbent'] = key
+            engine.finalize()
+            seen = []
+            class Evaluator:
+                runtime = {}
+                def __call__(self, code, subset, seconds, replica, *, seed=0):
+                    seen.append((replica, seed))
+                    return result([30 + seed] * len(subset), subset, 'minimize')
+            with patch('aad.v5_1_ale.AleBatchEvaluator', return_value=Evaluator()), patch(
+                    'aad.v5_1_ale.generate', return_value=['private a', 'private b']):
+                report = private_test(run, bundle, archive)
+            self.assertEqual(seen, [('private-r0', 0), ('private-r1', 1), ('private-r2', 2)])
+            self.assertEqual(report['private_mean'], 31)
+            self.assertEqual(report['evaluation_count'], 3)
+            self.assertEqual(report['algorithm_seeds'], [0, 1, 2])
 
 
 if __name__ == '__main__':

@@ -9,7 +9,7 @@ from .provider import BudgetExhausted
 from .io import save_json,digest
 
 class V5Provider(V4Provider):
-    def request(self,kind,task):
+    def request_body(self,kind,task):
         if kind not in ('program','edit'):raise ValueError('Unknown v5 request kind')
         rule=('Return only complete executable C++17 source, NOT JSON. Start with a concise comment describing the hypothesis and changed mechanism, at most eight lines. End with // AAD_V5_COMPLETE.' if kind=='program' else
               'Return only JSON with hypothesis (short string), parent_sha256, and edits (1..6 objects each containing old and new source strings). Anchors must be unique, disjoint substrings of the ORIGINAL parent. Related declarations, helpers and call sites may be changed together. Keep unrelated code unchanged. Preserve // AAD_V5_COMPLETE.')
@@ -19,6 +19,10 @@ class V5Provider(V4Provider):
               'messages':[{'role':'system','content':system},
                           {'role':'user','content':json.dumps({'problem':PROBLEM,**task},ensure_ascii=False)}]}
         if kind=='edit':body['response_format']={'type':'json_object'}
+        return body
+
+    def request(self,kind,task):
+        body=self.request_body(kind,task)
         reserve=len(json.dumps(body).encode('utf-8'))+1024+65536
         if self.requests>=self.max_calls or (self.max_tokens_total>0 and self.charged_tokens+reserve>self.max_tokens_total):
             raise BudgetExhausted('v5 budget exhausted before HTTP')

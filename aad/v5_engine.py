@@ -102,6 +102,17 @@ class V5Engine(V4Engine):
                 self.s['incumbent']=ident;p['status']='incumbent_promoted';return
         p['status']='archived'
 
+    def parse_response(self,kind,parent,content):
+        if kind=='edit':code,hypothesis=edit(self.source(parent),content)
+        else:code=program(content);hypothesis='\n'.join(code.splitlines()[:8])[:2000]
+        return code,hypothesis,{}
+
+    def augment_task(self,pending,task):return task
+
+    def note_response(self,pending,content):pass
+
+    def record_attempt(self,pending):pass
+
     def run(self):
         if self.s['frozen'] or self.s['validation_started'] or self.s.get('development_closed'):raise ValueError('Development is closed')
         while self.s['pending'] or self.provider.requests<self.provider.max_calls:
@@ -116,18 +127,22 @@ class V5Engine(V4Engine):
                     task.update(parent_source=self.source(parent),parent_sha256=parent,feedback=self.feedback(parent),
                         recent_experiments=[{k:e.get(k) for k in ('arm','status','parent_gain','error')} for e in self.s['events'][-8:]])
                 if p.get('donor'):task['donor_source']=self.source(p['donor'])
+                task=self.augment_task(p,task)
                 kind='edit' if p['arm']=='local' else 'program'
                 if 'candidate' not in p:
                     response=self.invoke(kind,task,'implementation_call')
-                    if kind=='edit':code,hypothesis=edit(self.source(parent),response['content'])
-                    else:code=program(response['content']);hypothesis='\n'.join(code.splitlines()[:8])[:2000]
-                    ident=digest(code);p.update(candidate=ident,implementation_kind=kind)
+                    self.note_response(p,response['content'])
+                    code,hypothesis,metadata=self.parse_response(kind,parent,response['content'])
+                    ident=digest(code)
+                    if ident in self.s['records'] and any(self.s['records'][ident].get(k)!=v for k,v in metadata.items()):
+                        raise ValueError('Conflicting metadata for identical candidate source')
+                    p.update(candidate=ident,implementation_kind=kind,**metadata)
                     if ident not in self.s['records']:
                         folder=self.root/'candidates'/ident;folder.mkdir(parents=True,exist_ok=True)
                         (folder/'solution.cpp').write_text(code,encoding='utf-8')
                         self.s['records'][ident]={'parent':parent,'donor':p.get('donor'),
                             'lineage':self.s['records'][parent]['lineage'] if parent else ident,
-                            'hypothesis':hypothesis,'implementation_call':response['call_id'],'implementation_kind':kind}
+                            'hypothesis':hypothesis,'implementation_call':response['call_id'],'implementation_kind':kind,**metadata}
                     else:p['duplicate']=True
                     self.save()
                 ident=p['candidate']
@@ -141,6 +156,7 @@ class V5Engine(V4Engine):
             p['parent_gain']=(repeated_mean(record)-repeated_mean(self.s['records'][parent])) if parent and valid_for_archive(record) else 0
             p['gain']=(self.mean(self.s['incumbent']) if self.s['incumbent'] else 0)-before
             p['tokens']=sum(r.get('usage',{}).get('total_tokens',r.get('reserved_tokens',0)) for r in self.provider.ledger[p['start_call']:])
+            self.record_attempt(p)
             self.s['events'].append(dict(p));self.s['pending']=None;self.save()
             print({'call':self.provider.requests,'arm':p['arm'],'status':p['status'],
                    'incumbent_train_mean':self.mean(self.s['incumbent']) if self.s['incumbent'] else None},flush=True)

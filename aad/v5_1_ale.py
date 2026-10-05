@@ -10,6 +10,8 @@ from pathlib import Path, PurePosixPath
 
 from .io import digest, read_json, save_json
 from .problem import Case
+from .v5_1_evaluation import (EVALUATION_PROTOCOL, aggregate_evaluations,
+                              evaluation_seeds, seeded_source)
 
 ALE_COMMIT = '3da9b12fb5d112dabb3af693d1a42031c95142bc'
 DATA_REVISION = '0f42617'
@@ -138,7 +140,9 @@ def statement_for(task):
             f'The process time limit is {task["time_limit"]} seconds including startup and I/O; '
             f'memory limit is {task["memory_limit"]} bytes. Finish with a safety margin. '
             f'Optimize the arithmetic mean of raw per-case scores ({task["direction"]}). '
-            'Randomness must be reproducible. No files, network, subprocesses, evaluator inspection '
+            'The framework defines the C++ macro AAD_RANDOM_SEED as 0, 1 or 2; initialize all '
+            'PRNGs from it, never redefine it or seed from time/random_device. '
+            'No files, network, subprocesses, evaluator inspection '
             'or known-input lookup. No initial solution is supplied.')
 
 
@@ -171,6 +175,7 @@ def runtime_identity(root):
     from ale_bench import constants
     from ale_bench.code_language import CodeLanguage, JudgeVersion, get_docker_image_name
     from ale_bench.utils import docker_client
+    from .v5_1_cpu import detect_policy
     sdk_root = Path(ale_bench.__file__).parent
     sdk_hashes = {p.relative_to(sdk_root).as_posix(): sha256_file(p)
                   for p in sorted(sdk_root.rglob('*.py'))}
@@ -178,6 +183,7 @@ def runtime_identity(root):
              constants.RUST_TOOL_DOCKER_IMAGE}
     with docker_client() as client:
         images = {name: client.images.get(name).id for name in sorted(names)}
+        cpu_policy = detect_policy(client, constants.RUST_TOOL_DOCKER_IMAGE)
     binaries = {name: sha256_file(Path(root) / 'tools/target/release' / name)
                 for name in ('gen', 'tester', 'vis')
                 if (Path(root) / 'tools/target/release' / name).is_file()}
@@ -185,52 +191,60 @@ def runtime_identity(root):
         raise ValueError('Build the official gen and tester tools before running')
     return {'ale_version': importlib.metadata.version('ale-bench'),
             'sdk_sha256': digest(json.dumps(sdk_hashes, sort_keys=True)),
-            'binaries': binaries, 'docker_images': images, 'judge_version': '202301'}
+            'binaries': binaries, 'docker_images': images, 'judge_version': '202301',
+            'cpu_policy': cpu_policy}
 
 
 class AleBatchEvaluator:
-    def __init__(self, task_root, cache_root, workers=1):
-        if type(workers) is not int or workers < 1:
-            raise ValueError('workers must be positive')
+    def __init__(self, task_root, cache_root):
         self.task_root, self.cache_root = Path(task_root).resolve(), Path(cache_root)
         self.task, _ = load_task(self.task_root)
-        self.workers = workers
         self.runtime = runtime_identity(self.task_root)
-        self.signature = digest(json.dumps({'task': self.task, 'runtime': self.runtime,
-                                            'workers': workers}, sort_keys=True))
+        from .v5_1_cpu import make_runner
+        self.run_cases = make_runner(self.runtime['cpu_policy'], self.cache_root / 'cpu_leases')
+        self.signature = digest(json.dumps({'task': self.task, 'runtime': self.runtime}, sort_keys=True))
 
-    def __call__(self, code, cases, seconds, replica):
+    def __call__(self, code, cases, seconds, replica, *, seed=0):
         if seconds != self.task['time_limit']:
             raise ValueError('Use the official task time limit')
-        key = digest(json.dumps([self.signature, digest(code), seconds, replica,
+        executable_source = seeded_source(code, seed)
+        key = digest(json.dumps([EVALUATION_PROTOCOL, self.signature, digest(executable_source), seconds, replica,
                                  [(c.name, c.fingerprint) for c in cases]]))
         path = self.cache_root / f'{key}.json'
         if path.exists():
             return read_json(path)
         from ale_bench.code_language import CodeLanguage, JudgeVersion
         from ale_bench.data import ProblemType
-        from ale_bench.tool_wrappers import run_cases
-        items = run_cases(inputs=[c.text for c in cases], code=code,
+        items = self.run_cases(inputs=[c.text for c in cases], code=executable_source,
                           code_language=CodeLanguage.CPP17, judge_version=JudgeVersion.V202301,
                           time_limit=seconds, memory_limit=self.task['memory_limit'],
                           problem_id=self.task['problem_id'], problem_type=ProblemType.BATCH,
                           tool_dir=self.task_root, return_details=True,
-                          skip_local_visualization=True, num_workers=self.workers)
+                          skip_local_visualization=True)
         result = summarize(items, cases, self.task['direction'])
+        result.update(seed=seed, source_sha256=digest(code), executable_source_sha256=digest(executable_source))
+        for row in result['cases']:
+            row['seed'] = seed
         save_json(path, result)
         return result
 
 
-def private_test(run, task_root, archive, workers=1):
-    """Read private seed field only after verifying a frozen v5.1 source and protocol."""
+def private_test(run, task_root, archive):
+    """Read private seed field only after verifying a frozen v5.2 source and protocol."""
     run = Path(run)
     protocol, state = read_json(run / 'protocol.json'), read_json(run / 'state.json')
-    if (protocol.get('version') != '5.1' or not state.get('frozen')
+    if (protocol.get('version') != '5.2' or not state.get('frozen')
             or not state.get('development_closed') or state.get('pending')):
-        raise ValueError('Freeze v5.1 training before private testing')
+        raise ValueError('Freeze v5.2 training before private testing')
     if digest(json.dumps(protocol, sort_keys=True)) != state['signature']:
         raise ValueError('Protocol changed')
     champion = state['champion']
+    record = state['records'][champion]
+    seeds_for_algorithm = evaluation_seeds(record.get('is_randomized'))
+    if (protocol['config'].get('evaluation_protocol') != EVALUATION_PROTOCOL
+            or len(record.get('evaluations', [])) != len(seeds_for_algorithm)
+            or not all(r['valid'] for r in record['evaluations'])):
+        raise ValueError('Incomplete or incompatible frozen evaluations')
     code = (run / 'best.cpp').read_text(encoding='utf-8')
     if digest(code) != champion or digest((run / 'candidates' / champion / 'solution.cpp').read_text(
             encoding='utf-8')) != champion:
@@ -243,8 +257,8 @@ def private_test(run, task_root, archive, workers=1):
     report_path, receipt_path = run / 'private_report.json', run / 'private_receipt.json'
     if report_path.exists() or receipt_path.exists():
         raise ValueError('Private evaluation already started; inspect existing receipt')
-    evaluator = AleBatchEvaluator(task_root, run / 'private_measurements', workers)
-    if evaluator.runtime != protocol['config']['runtime'] or workers != protocol['config']['workers']:
+    evaluator = AleBatchEvaluator(task_root, run / 'private_measurements')
+    if evaluator.runtime != protocol['config']['runtime']:
         raise ValueError('Evaluation environment changed')
     # Exclusive creation also prevents two private writers for the same run.
     with receipt_path.open('x', encoding='utf-8') as receipt:
@@ -259,10 +273,17 @@ def private_test(run, task_root, archive, workers=1):
         raise ValueError('Private generator case count mismatch')
     if {c.fingerprint for c in cases} & set(protocol['inputs'].values()):
         raise ValueError('Private inputs overlap training')
-    result = evaluator(code, cases, task['time_limit'], 'private-r0')
-    report = {'version': '5.1', 'champion': champion, 'problem_id': task['problem_id'],
+    results = []
+    for index, seed in enumerate(seeds_for_algorithm):
+        results.append(evaluator(code, cases, task['time_limit'], f'private-r{index}', seed=seed))
+        if not results[-1]['valid']:
+            break
+    result = aggregate_evaluations(results)
+    report = {'version': '5.2', 'champion': champion, 'problem_id': task['problem_id'],
               'direction': task['direction'], 'private_count': len(cases),
               'private_mean': result['raw_mean'], 'valid': result['valid'],
+              'is_randomized': record['is_randomized'], 'evaluation_count': len(results),
+              'algorithm_seeds': list(seeds_for_algorithm[:len(results)]),
               'valid_count': sum(r['status'] == 'AC' for r in result['cases']),
               'seed_sha256': digest(json.dumps(seeds)),
               'scope': 'Official ALE private seeds and tools; raw mean, not leaderboard rank'}

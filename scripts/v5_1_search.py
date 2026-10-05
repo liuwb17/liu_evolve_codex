@@ -1,4 +1,4 @@
-"""Prepare, evolve, freeze and test ALE-Bench batch problems with v5.1."""
+"""Prepare, evolve, freeze and test ALE-Bench batch problems with v5.2."""
 import argparse
 from contextlib import contextmanager
 import getpass
@@ -24,7 +24,7 @@ def run_lock(root):
         raise ValueError('Run is locked; inspect the other process before removing a stale lock') from None
     try:
         with stream:
-            stream.write('v5.1 single writer\n')
+            stream.write('v5.2 single writer\n')
         yield
     finally:
         path.unlink()
@@ -54,9 +54,13 @@ def main(argv=None):
             sub.add_argument('--calls', type=int, default=256)
             sub.add_argument('--token-budget', type=int, default=0)
             sub.add_argument('--model', default='deepseek-flash')
-            sub.add_argument('--workers', type=int, default=1)
+            sub.add_argument('--para', type=int, choices=[4], default=None,
+                             help='Four concurrent LLM tasks per round; omitted retains serial v5 scheduling')
+            sub.add_argument('--failure-experience', action=argparse.BooleanOptionalAction, default=False,
+                             help='Provide up to eight failed attempts specific to the main parent')
+            sub.add_argument('--plan', action=argparse.BooleanOptionalAction, default=False,
+                             help='One separately budgeted Plan call for four cold-start hints (default: disabled)')
             sub.add_argument('--promotion-margin', type=float, default=0)
-            sub.add_argument('--repeat-slack', type=float, default=0)
             sub.add_argument('--smoke-count', type=int, default=6)
             sub.add_argument('--resume', action='store_true')
             sub.add_argument('--ask-key', action='store_true')
@@ -82,8 +86,8 @@ def main(argv=None):
         if args.action in ('freeze', 'private'):
             protocol = read_json(root / 'protocol.json')
             config = protocol['config']
-            if protocol.get('version') != '5.1' or task_hash != config['task_sha256']:
-                raise ValueError('Not this v5.1 task')
+            if protocol.get('version') != '5.2' or task_hash != config['task_sha256']:
+                raise ValueError('Not this v5.2 run/task')
             if implementation_hashes() != config['implementation_hashes']:
                 raise ValueError('Implementation changed; use the pinned run source')
             if args.action == 'freeze':
@@ -94,7 +98,7 @@ def main(argv=None):
                 if not state.get('frozen'):
                     raise ValueError('Freeze training before private testing')
                 archive = args.archive or download_archive(task['problem_id'])
-                print(private_test(root, args.task, archive, config['workers']))
+                print(private_test(root, args.task, archive))
             return
         exists = (root / 'state.json').exists()
         if exists != args.resume:
@@ -105,13 +109,14 @@ def main(argv=None):
             raise ValueError('Development is closed')
         if args.calls < 1 or args.token_budget < 0:
             raise ValueError('Invalid request/token budget')
-        evaluator = AleBatchEvaluator(args.task, root / 'measurements', args.workers)
+        evaluator = AleBatchEvaluator(args.task, root / 'measurements')
         config = {'problem_id': task['problem_id'], 'direction': task['direction'],
                   'time_limit': task['time_limit'], 'task_sha256': task_hash,
-                  'runtime': evaluator.runtime, 'workers': args.workers,
+                  'runtime': evaluator.runtime,
                   'implementation_hashes': implementation_hashes(),
                   'model': args.model, 'calls': args.calls, 'token_budget': args.token_budget,
-                  'promotion_margin': args.promotion_margin, 'repeat_slack': args.repeat_slack,
+                  'plan': args.plan, 'para': args.para, 'failure_experience': args.failure_experience,
+                  'promotion_margin': args.promotion_margin,
                   'smoke_count': args.smoke_count}
         # Check the protocol before opening a provider or touching its ledger.
         engine = V51Engine(root, None, evaluator, train, config)
