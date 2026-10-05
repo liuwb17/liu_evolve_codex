@@ -4,10 +4,13 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mosaic-aad"
-version = "0.5.0"
+version = "0.5.1"
 description = "Reproducible block-level algorithm evolution with AHC001 and ALE-Bench"
 requires-python = ">=3.11"
 dependencies = []
+
+[project.optional-dependencies]
+ale-v5-1 = ["ale-bench @ git+https://github.com/SakanaAI/ALE-Bench.git@3da9b12fb5d112dabb3af693d1a42031c95142bc"]
 
 [project.scripts]
 aad = "aad.cli:main"

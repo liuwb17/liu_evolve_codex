@@ -1,5 +1,19 @@
 # Handoff instructions for coding agents
 
+## v5.1 scope agreed in this session
+
+- The original GitHub AHC001-tailored v5 is called v5.0; the generalized version is v5.1. Do not add a Plan stage in this change.
+
+- Work only from this GitHub-derived checkout (baseline `43a371a`), not the other local v5 forks.
+- See `docs/V5_1.md`. v5.1 supports ALE-Bench batch/non-interactive problems and C++17 solvers.
+- Default training seeds are official public 0–49; the public subset is configurable. No validation split or validation selection.
+- Freeze the three-repeat training incumbent before reading/generating/evaluating official private seeds. Private scores never guide evolution.
+- Optimize mean raw score in the official maximize/minimize direction; promotion margin defaults to zero, with two of three repeat gains positive.
+- Historical v5 modules and checkpoints retain their old behavior. New v5.1 runs use protocol version 5.1 and separate directories.
+- ALE tools run in Docker under Linux/WSL. Tests are offline/mocked unless explicitly identified as Docker integration tests.
+
+## Historical v3/v5 instructions
+
 Read README.md before modifying this research project. It documents actual v3/v5 behavior, known limitations, and paths that are not portable.
 
 - v3/v5 controllers are Python; historical generated solvers are C++17. Python-solver migration is not implemented.
